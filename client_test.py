@@ -12,7 +12,7 @@ async def main():
             r = await s.call_tool("list_posts", {})
             print("posts found:", len(r.content))
             for block in r.content:
-            print(block.text)
+                print(block.text)
 
 
 asyncio.run(main())
