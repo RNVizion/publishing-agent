@@ -1,5 +1,7 @@
 import os
 import re
+import sys
+import subprocess
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
@@ -61,6 +63,21 @@ def validate_post(slug: str) -> dict:
         "missing_required": missing_required,
         "missing_recommended": missing_recommended,
     }
+
+@mcp.tool()
+def generate_card(slug: str, summary: str = "") -> dict:
+    """Generate the blog-index card HTML for a post by calling generate_card.py.
+    Pass `summary` to override the card teaser line."""
+    cmd = [sys.executable, "scripts/generate_card.py", f"blog/{slug}/index.html"]
+    if summary:
+        cmd += ["--summary", summary]
+    result = subprocess.run(cmd, cwd=BLOG_REPO, capture_output=True, text=True)
+    if result.returncode != 0:
+        return {"slug": slug, "ok": False,
+                "error": result.stderr.strip() or "generate_card.py failed"}
+    return {"slug": slug, "ok": True,
+            "card_html": result.stdout.strip(),
+            "warnings": result.stderr.strip() or None}
 
 if __name__ == "__main__":
     mcp.run()
