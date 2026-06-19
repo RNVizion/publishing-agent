@@ -111,4 +111,7 @@ def insert_card(slug: str, card_html: str, dry_run: bool = False) -> dict:
     index_path.write_text(new_html, encoding="utf-8")
     return {"slug": slug, "ok": True, "inserted": True, "anchor": anchor}
 
-
+if __name__ == "__main__":
+    import sys
+    print("SERVER STARTING", file=sys.stderr)
+    mcp.run()
