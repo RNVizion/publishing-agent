@@ -79,5 +79,34 @@ def generate_card(slug: str, summary: str = "") -> dict:
             "card_html": result.stdout.strip(),
             "warnings": result.stderr.strip() or None}
 
-if __name__ == "__main__":
-    mcp.run()
+@mcp.tool()
+def insert_card(slug: str, card_html: str, dry_run: bool = False) -> dict:
+    """Insert a post card at the top of the blog index (newest-first).
+    Idempotent: does nothing if a card for this slug is already present.
+    dry_run=True reports what would happen without writing."""
+    index_path = BLOG_REPO / "blog" / "index.html"
+    if not index_path.exists():
+        return {"slug": slug, "ok": False, "error": "blog/index.html not found"}
+    html = index_path.read_text(encoding="utf-8")
+
+    if f'/blog/{slug}/"' in html:
+        return {"slug": slug, "ok": True, "inserted": False, "reason": "already in index"}
+
+    card = card_html.strip()
+    marker = "<!-- post-cards -->"
+    if marker in html:
+        new_html = html.replace(marker, marker + "\n" + card, 1)
+        anchor = "marker"
+    else:
+        m = re.search(r'<article class="post-card">', html)
+        if not m:
+            return {"slug": slug, "ok": False,
+                    "error": "no insertion point: add a '<!-- post-cards -->' marker or a first card to blog/index.html"}
+        new_html = html[:m.start()] + card + "\n" + html[m.start():]
+        anchor = "before first card"
+
+    if dry_run:
+        return {"slug": slug, "ok": True, "inserted": False, "would_insert": True, "anchor": anchor}
+
+    index_path.write_text(new_html, encoding="utf-8")
+    return {"slug": slug, "ok": True, "inserted": True, "anchor": anchor}
