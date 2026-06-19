@@ -112,6 +112,6 @@ def insert_card(slug: str, card_html: str, dry_run: bool = False) -> dict:
     return {"slug": slug, "ok": True, "inserted": True, "anchor": anchor}
 
 if __name__ == "__main__":
-    import sys
-    print("SERVER STARTING", file=sys.stderr)
+    print("rnv-publishing MCP server ready", file=sys.stderr, flush=True)
     mcp.run()
+
