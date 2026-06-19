@@ -9,7 +9,7 @@ async def main():
             await s.initialize()
             tools = await s.list_tools()
             print("tools:", [t.name for t in tools.tools])
-            r = await s.call_tool("ping", {"name": "RNV"})
-            print("result:", r.content[0].text)
+            r = await s.call_tool("list_posts", {})
+            print(r.content[0].text)
 
 asyncio.run(main())
