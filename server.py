@@ -5,9 +5,10 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("rnv-publishing")
 
-# Blog repo path. Defaults to the sibling clone in the codespace;
-# override with the BLOG_REPO env var anywhere else.
 BLOG_REPO = Path(os.environ.get("BLOG_REPO", "/workspaces/rnvizion.github.io"))
+
+def _strip_comments(html: str) -> str:
+    return re.sub(r"<!--.*?-->", "", html, flags=re.S)
 
 def _meta(html: str, attr: str, value: str) -> str:
     """Pull a <meta {attr}="{value}" content="..."> field; '' if absent.
@@ -26,12 +27,40 @@ def list_posts() -> list[dict]:
         raise ValueError(f"blog dir not found at {blog_dir} — set BLOG_REPO to your blog repo path")
     posts = []
     for index in sorted(blog_dir.glob("*/index.html")):
-        html = index.read_text(encoding="utf-8")
+        html = _strip_comments(index.read_text(encoding="utf-8"))
         slug = index.parent.name
         title = _meta(html, "property", "og:title") or slug
         date = _meta(html, "property", "article:published_time")
         posts.append({"slug": slug, "title": title, "published": date})
     return posts
+
+@mcp.tool()
+def validate_post(slug: str) -> dict:
+    """Check a post has everything the feed needs before publishing.
+    Returns ok=False with the missing items if anything required is absent."""
+    path = BLOG_REPO / "blog" / slug / "index.html"
+    if not path.exists():
+        return {"slug": slug, "ok": False, "error": f"no index.html at blog/{slug}/"}
+    body = _strip_comments(path.read_text(encoding="utf-8"))
+    required = {
+        "<article> block": bool(re.search(r"<article[^>]*>.*?</article>", body, flags=re.S)),
+        "og:url": bool(_meta(body, "property", "og:url")),
+        "article:published_time": bool(_meta(body, "property", "article:published_time")),
+    }
+    recommended = {
+        "og:title": bool(_meta(body, "property", "og:title")),
+        "og:description": bool(_meta(body, "property", "og:description")),
+        "card:summary": bool(_meta(body, "name", "card:summary")),
+        "article:author": bool(_meta(body, "property", "article:author")),
+    }
+    missing_required = [k for k, ok in required.items() if not ok]
+    missing_recommended = [k for k, ok in recommended.items() if not ok]
+    return {
+        "slug": slug,
+        "ok": not missing_required,
+        "missing_required": missing_required,
+        "missing_recommended": missing_recommended,
+    }
 
 if __name__ == "__main__":
     mcp.run()
