@@ -1,13 +1,17 @@
 import os
 import re
 import sys
+import time
 import subprocess
+import urllib.request
+import urllib.error
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("rnv-publishing")
 
 BLOG_REPO = Path(os.environ.get("BLOG_REPO", "/workspaces/rnvizion.github.io"))
+SITE_URL = os.environ.get("SITE_URL", "https://rnvizion.dev")
 
 def _strip_comments(html: str) -> str:
     return re.sub(r"<!--.*?-->", "", html, flags=re.S)
@@ -20,6 +24,10 @@ def _meta(html: str, attr: str, value: str) -> str:
         html, flags=re.I | re.S,
     )
     return m.group(2).strip() if m else ""
+
+def _git(*args):
+    """Run a git command inside the blog repo; returns the CompletedProcess."""
+    return subprocess.run(["git", *args], cwd=BLOG_REPO, capture_output=True, text=True)
 
 @mcp.tool()
 def list_posts() -> list[dict]:
@@ -111,7 +119,67 @@ def insert_card(slug: str, card_html: str, dry_run: bool = False) -> dict:
     index_path.write_text(new_html, encoding="utf-8")
     return {"slug": slug, "ok": True, "inserted": True, "anchor": anchor}
 
+@mcp.tool()
+def commit_and_push(slug: str, message: str = "", dry_run: bool = False) -> dict:
+    """Stage the post and the blog index, commit, and push to the remote.
+
+    Stages only blog/<slug>/index.html and blog/index.html — the two files a publish
+    touches — so unrelated working-tree changes are left alone. Idempotent: if those
+    files have no changes, it reports nothing to commit rather than erroring.
+    dry_run=True reports what would be committed without writing or pushing."""
+    post = f"blog/{slug}/index.html"
+    index = "blog/index.html"
+    msg = message or f"Publish: {slug}"
+
+    status = _git("status", "--porcelain", "--", post, index)
+    if status.returncode != 0:
+        return {"slug": slug, "ok": False, "error": status.stderr.strip() or "git status failed"}
+    pending = [line[3:] for line in status.stdout.splitlines() if line.strip()]
+    if not pending:
+        return {"slug": slug, "ok": True, "committed": False,
+                "reason": "nothing to commit (post and index already up to date)"}
+
+    if dry_run:
+        return {"slug": slug, "ok": True, "committed": False,
+                "would_commit": pending, "message": msg}
+
+    add = _git("add", "--", post, index)
+    if add.returncode != 0:
+        return {"slug": slug, "ok": False, "error": add.stderr.strip() or "git add failed"}
+    commit = _git("commit", "-m", msg)
+    if commit.returncode != 0:
+        return {"slug": slug, "ok": False, "error": commit.stderr.strip() or "git commit failed"}
+    push = _git("push")
+    if push.returncode != 0:
+        return {"slug": slug, "ok": False, "committed": True, "pushed": False,
+                "error": push.stderr.strip() or "git push failed"}
+    return {"slug": slug, "ok": True, "committed": True, "pushed": True,
+            "message": msg, "files": pending}
+
+@mcp.tool()
+def wait_for_live(slug: str, timeout: int = 180, interval: int = 10) -> dict:
+    """Poll the live post URL until it returns HTTP 200, up to `timeout` seconds.
+
+    Run after commit_and_push and before re-ingesting, so the RAG never fetches a
+    404/403 during the GitHub Pages deploy window. Returns ok=False on timeout."""
+    url = f"{SITE_URL}/blog/{slug}/"
+    deadline = time.monotonic() + timeout
+    last = None
+    while True:
+        try:
+            with urllib.request.urlopen(url, timeout=15) as r:
+                last = r.status
+                if r.status == 200:
+                    return {"slug": slug, "ok": True, "live": True, "status": 200, "url": url}
+        except urllib.error.HTTPError as e:
+            last = e.code
+        except Exception as e:  # connection errors, timeouts, DNS, etc.
+            last = str(e)
+        if time.monotonic() >= deadline:
+            return {"slug": slug, "ok": False, "live": False, "url": url,
+                    "last_status": last, "error": f"not live after {timeout}s (last seen: {last})"}
+        time.sleep(interval)
+
 if __name__ == "__main__":
     print("rnv-publishing MCP server ready", file=sys.stderr, flush=True)
     mcp.run()
-
