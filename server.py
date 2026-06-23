@@ -236,6 +236,57 @@ def update_corpus(slug: str, dry_run: bool = False) -> dict:
     return {"slug": slug, "ok": True, "added": True, "pushed": True, "url": url,
             "note": "pushed; the rebuild-corpus Action will re-ingest and update the Space"}
 
+@mcp.tool()
+def publish_post(slug: str, for_real: bool = False) -> dict:
+    """Run the entire publish chain for a post in one deterministic sequence and
+    stop at the first failure, returning the full trace.
+
+    Order: validate_post -> generate_card -> insert_card -> (if for_real)
+    commit_and_push -> wait_for_live -> update_corpus.
+
+    for_real=False (the default) is a dry run: it validates, builds the card, and
+    previews the index insert without writing, then stops — nothing is pushed.
+    for_real=True runs the whole thing for keeps. This is the one call the agent
+    should use to publish; the individual tools remain for single-step work."""
+    trace = []
+
+    def step(name, result):
+        entry = {"step": name}
+        entry.update(result if isinstance(result, dict) else {"result": result})
+        trace.append(entry)
+        return result
+
+    v = step("validate_post", validate_post(slug))
+    if not v.get("ok"):
+        return {"slug": slug, "ok": False, "stopped_at": "validate_post", "trace": trace}
+
+    c = step("generate_card", generate_card(slug))
+    if not c.get("ok"):
+        return {"slug": slug, "ok": False, "stopped_at": "generate_card", "trace": trace}
+
+    ins = step("insert_card", insert_card(slug, c.get("card_html", ""), dry_run=not for_real))
+    if not ins.get("ok"):
+        return {"slug": slug, "ok": False, "stopped_at": "insert_card", "trace": trace}
+
+    if not for_real:
+        return {"slug": slug, "ok": True, "dry_run": True,
+                "note": "dry run — nothing written or pushed; the steps above would run for real on publish",
+                "trace": trace}
+
+    cp = step("commit_and_push", commit_and_push(slug))
+    if not cp.get("ok"):
+        return {"slug": slug, "ok": False, "stopped_at": "commit_and_push", "trace": trace}
+
+    live = step("wait_for_live", wait_for_live(slug))
+    if not live.get("ok"):
+        return {"slug": slug, "ok": False, "stopped_at": "wait_for_live", "trace": trace}
+
+    uc = step("update_corpus", update_corpus(slug))
+    if not uc.get("ok"):
+        return {"slug": slug, "ok": False, "stopped_at": "update_corpus", "trace": trace}
+
+    return {"slug": slug, "ok": True, "published": True, "trace": trace}
+
 if __name__ == "__main__":
     print("rnv-publishing MCP server ready", file=sys.stderr, flush=True)
     mcp.run()
