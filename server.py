@@ -64,6 +64,7 @@ def validate_post(slug: str) -> dict:
         "og:description": bool(_meta(body, "property", "og:description")),
         "card:summary": bool(_meta(body, "name", "card:summary")),
         "article:author": bool(_meta(body, "property", "article:author")),
+        "og:image": bool(_meta(body, "property", "og:image")),
     }
     missing_required = [k for k, ok in required.items() if not ok]
     missing_recommended = [k for k, ok in recommended.items() if not ok]
@@ -128,7 +129,11 @@ def commit_and_push(slug: str, message: str = "", dry_run: bool = False) -> dict
     Stages only blog/<slug>/index.html and blog/index.html — the two files a publish
     touches — so unrelated working-tree changes are left alone. Idempotent: if those
     files have no changes, it reports nothing to commit rather than erroring.
-    dry_run=True reports what would be committed without writing or pushing."""
+    dry_run=True reports what would be committed without writing or pushing.
+
+    Note: the post's OG share image is NOT committed here. It's rendered and
+    committed by the build-og GitHub Action that fires on this push, so it lands a
+    beat after the page. wait_for_live polls for it and reports if it's missing."""
     post = f"blog/{slug}/index.html"
     index = "blog/index.html"
     msg = message or f"Publish: {slug}"
@@ -158,12 +163,37 @@ def commit_and_push(slug: str, message: str = "", dry_run: bool = False) -> dict
     return {"slug": slug, "ok": True, "committed": True, "pushed": True,
             "message": msg, "files": pending}
 
+def _head_status(url: str, timeout: int = 15):
+    """HEAD a URL; return the HTTP status code, or the error string if unreachable."""
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception as e:  # connection errors, timeouts, DNS, etc.
+        return str(e)
+
 @mcp.tool()
-def wait_for_live(slug: str, timeout: int = 180, interval: int = 10) -> dict:
-    """Poll the live post URL until it returns HTTP 200, up to `timeout` seconds.
+def wait_for_live(slug: str, timeout: int = 180, interval: int = 10,
+                  og_timeout: int = 90) -> dict:
+    """Poll the live post URL until it returns HTTP 200, then confirm the post's
+    og:image is live too.
 
     Run after commit_and_push and before re-ingesting, so the RAG never fetches a
-    404/403 during the GitHub Pages deploy window. Returns ok=False on timeout."""
+    404/403 during the GitHub Pages deploy window.
+
+    Two checks, two roles:
+      - The PAGE is the gate. ok=False if it isn't 200 within `timeout` seconds.
+      - The og:image is ADVISORY. It's rendered and committed by the build-og
+        Action *after* this push, so it legitimately lands a beat later; it gets
+        its own `og_timeout` budget starting once the page is live. A missing image
+        does NOT fail the publish (the post and corpus are fine without it), but it
+        is surfaced loudly as og_image_live=False so a broken share card never
+        passes silently — the exact gap that shipped three imageless posts before.
+
+    The image URL is read from the post's own og:image meta, so the check follows
+    whatever the post actually claims rather than a hardcoded path."""
     url = f"{SITE_URL}/blog/{slug}/"
     deadline = time.monotonic() + timeout
     last = None
@@ -172,7 +202,7 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10) -> dict:
             with urllib.request.urlopen(url, timeout=15) as r:
                 last = r.status
                 if r.status == 200:
-                    return {"slug": slug, "ok": True, "live": True, "status": 200, "url": url}
+                    break
         except urllib.error.HTTPError as e:
             last = e.code
         except Exception as e:  # connection errors, timeouts, DNS, etc.
@@ -180,6 +210,38 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10) -> dict:
         if time.monotonic() >= deadline:
             return {"slug": slug, "ok": False, "live": False, "url": url,
                     "last_status": last, "error": f"not live after {timeout}s (last seen: {last})"}
+        time.sleep(interval)
+
+    result = {"slug": slug, "ok": True, "live": True, "status": 200, "url": url}
+
+    # Page is live. Now confirm the og:image the post declares is reachable.
+    post_path = BLOG_REPO / "blog" / slug / "index.html"
+    og_image = ""
+    if post_path.exists():
+        og_image = _meta(_strip_comments(post_path.read_text(encoding="utf-8")),
+                         "property", "og:image")
+    if not og_image:
+        result["og_image_live"] = None
+        result["og_image_warning"] = "post declares no og:image meta — nothing to verify"
+        return result
+
+    result["og_image_url"] = og_image
+    og_deadline = time.monotonic() + og_timeout
+    og_last = None
+    while True:
+        og_last = _head_status(og_image)
+        if og_last == 200:
+            result["og_image_live"] = True
+            result["og_image_status"] = 200
+            return result
+        if time.monotonic() >= og_deadline:
+            result["og_image_live"] = False
+            result["og_image_status"] = og_last
+            result["og_image_warning"] = (
+                f"og:image not live after {og_timeout}s (last seen: {og_last}); "
+                f"the build-og Action may still be running, or failed to render {og_image}"
+            )
+            return result
         time.sleep(interval)
 
 @mcp.tool()
@@ -247,8 +309,13 @@ def publish_post(slug: str, for_real: bool = False) -> dict:
     for_real=False (the default) is a dry run: it validates, builds the card, and
     previews the index insert without writing, then stops — nothing is pushed.
     for_real=True runs the whole thing for keeps. This is the one call the agent
-    should use to publish; the individual tools remain for single-step work."""
+    should use to publish; the individual tools remain for single-step work.
+
+    A live-but-imageless share card is a warning, not a failure: the post still
+    publishes and the corpus still ingests, but `warnings` carries the og:image
+    notice so it never slips by unseen."""
     trace = []
+    warnings = []
 
     def step(name, result):
         entry = {"step": name}
@@ -280,12 +347,17 @@ def publish_post(slug: str, for_real: bool = False) -> dict:
     live = step("wait_for_live", wait_for_live(slug))
     if not live.get("ok"):
         return {"slug": slug, "ok": False, "stopped_at": "wait_for_live", "trace": trace}
+    if live.get("og_image_live") is False:
+        warnings.append(live.get("og_image_warning", "og:image not live yet"))
 
     uc = step("update_corpus", update_corpus(slug))
     if not uc.get("ok"):
         return {"slug": slug, "ok": False, "stopped_at": "update_corpus", "trace": trace}
 
-    return {"slug": slug, "ok": True, "published": True, "trace": trace}
+    result = {"slug": slug, "ok": True, "published": True, "trace": trace}
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 if __name__ == "__main__":
     print("rnv-publishing MCP server ready", file=sys.stderr, flush=True)
