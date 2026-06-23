@@ -1,4 +1,4 @@
-# rnv-publishing
+# rnv-publishing (MCP)
 
 A publishing agent for [rnvizion.dev](https://rnvizion.dev). One instruction ships a blog post end to end: it validates the post, generates the index card and a per-post social image, commits and pushes, waits for the page to go live, then refreshes the retrieval assistant that answers questions about the site.
 
