@@ -14,7 +14,8 @@ SYSTEM = (
     "(3) call insert_card to add it to the index. "
     "(4) call commit_and_push to commit and push the post and index. "
     "(5) call wait_for_live to confirm the post is serving before you finish. "
-    "Pass dry_run=true to BOTH insert_card and commit_and_push unless the user explicitly says to publish for real; "
+    "(6) call update_corpus to register the post with the RAG and trigger a rebuild. "
+    "Pass dry_run=true to update_corpus, insert_card and commit_and_push unless the user explicitly says to publish for real; "
     "on a dry run, do NOT call wait_for_live (nothing was pushed). "
     "If any step returns ok=false, STOP and report it. Explain each step as you go."
 )
