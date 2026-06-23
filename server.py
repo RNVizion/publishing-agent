@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import json
 import time
 import subprocess
 import urllib.request
@@ -12,6 +13,7 @@ mcp = FastMCP("rnv-publishing")
 
 BLOG_REPO = Path(os.environ.get("BLOG_REPO", "/workspaces/rnvizion.github.io"))
 SITE_URL = os.environ.get("SITE_URL", "https://rnvizion.dev")
+CORPUS_REPO = Path(os.environ.get("CORPUS_REPO", "/workspaces/ask-the-corpus"))
 
 def _strip_comments(html: str) -> str:
     return re.sub(r"<!--.*?-->", "", html, flags=re.S)
@@ -179,6 +181,60 @@ def wait_for_live(slug: str, timeout: int = 180, interval: int = 10) -> dict:
             return {"slug": slug, "ok": False, "live": False, "url": url,
                     "last_status": last, "error": f"not live after {timeout}s (last seen: {last})"}
         time.sleep(interval)
+
+@mcp.tool()
+def update_corpus(slug: str, dry_run: bool = False) -> dict:
+    """Register a published post with the RAG corpus and trigger a rebuild.
+
+    Verifies the live post URL returns 200 (refuses to register a dead source),
+    appends it to the corpus sources.json if not already present, then commits and
+    pushes that change. A GitHub Action in the corpus repo (rebuild-corpus.yml)
+    does the actual re-ingest and Hugging Face Space push on that push, so this tool
+    stays light and never imports the ML stack.
+    dry_run=True reports what it would add without writing or pushing."""
+    url = f"{SITE_URL}/blog/{slug}/"
+
+    # Refuse to register a source that isn't live (no broken sources).
+    try:
+        with urllib.request.urlopen(url, timeout=15) as r:
+            if r.status != 200:
+                return {"slug": slug, "ok": False,
+                        "error": f"{url} returned {r.status}; not registering a dead source (run wait_for_live first)"}
+    except Exception as e:
+        return {"slug": slug, "ok": False,
+                "error": f"{url} not reachable ({e}); run wait_for_live first"}
+
+    sources_path = CORPUS_REPO / "sources.json"
+    if not sources_path.exists():
+        return {"slug": slug, "ok": False,
+                "error": f"sources.json not found at {sources_path} — set CORPUS_REPO to your ask-the-corpus checkout"}
+
+    data = json.loads(sources_path.read_text(encoding="utf-8"))
+    sources = data.setdefault("sources", [])
+    if any(s.get("url") == url or s.get("id") == slug for s in sources):
+        return {"slug": slug, "ok": True, "added": False, "reason": "already in sources.json"}
+
+    if dry_run:
+        return {"slug": slug, "ok": True, "added": False, "would_add": {"id": slug, "url": url}}
+
+    sources.append({"id": slug, "url": url})
+    sources_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    def _cgit(*args):
+        return subprocess.run(["git", *args], cwd=CORPUS_REPO, capture_output=True, text=True)
+
+    add = _cgit("add", "--", "sources.json")
+    if add.returncode != 0:
+        return {"slug": slug, "ok": False, "added": True, "error": add.stderr.strip() or "git add failed"}
+    commit = _cgit("commit", "-m", f"corpus: add {slug}")
+    if commit.returncode != 0:
+        return {"slug": slug, "ok": False, "added": True, "error": commit.stderr.strip() or "git commit failed"}
+    push = _cgit("push")
+    if push.returncode != 0:
+        return {"slug": slug, "ok": False, "added": True, "pushed": False,
+                "error": push.stderr.strip() or "git push failed (corpus repo write permission?)"}
+    return {"slug": slug, "ok": True, "added": True, "pushed": True, "url": url,
+            "note": "pushed; the rebuild-corpus Action will re-ingest and update the Space"}
 
 if __name__ == "__main__":
     print("rnv-publishing MCP server ready", file=sys.stderr, flush=True)
