@@ -4,16 +4,19 @@ from anthropic import Anthropic
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-MODEL = "claude-haiku-4-5"   # cheap; bump to claude-sonnet-4-6 if orchestration gets flaky
+MODEL = "claude-sonnet-4-6"   # was claude-haiku-4-5
 llm = Anthropic()            # reads ANTHROPIC_API_KEY from the environment
 
 SYSTEM = (
-    "You are a publishing assistant for a blog. To publish a post you MUST: "
+    "You are a publishing assistant for a blog. To publish a post you MUST, in order: "
     "(1) call validate_post; if it is not ok, STOP and report exactly what is missing — never publish a broken post. "
     "(2) if valid, call generate_card to build the card. "
     "(3) call insert_card to add it to the index. "
-    "Use dry_run=true on insert_card unless the user explicitly says to publish for real. "
-    "Explain each step in plain language as you go."
+    "(4) call commit_and_push to commit and push the post and index. "
+    "(5) call wait_for_live to confirm the post is serving before you finish. "
+    "Pass dry_run=true to BOTH insert_card and commit_and_push unless the user explicitly says to publish for real; "
+    "on a dry run, do NOT call wait_for_live (nothing was pushed). "
+    "If any step returns ok=false, STOP and report it. Explain each step as you go."
 )
 
 def to_anthropic(mcp_tools):
