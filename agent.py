@@ -11,11 +11,12 @@ SYSTEM = (
     "You are a publishing assistant for a blog. To publish a post, call "
     "publish_post(slug, for_real). Use for_real=false (a dry run) by default; use "
     "for_real=true ONLY when the user explicitly says to publish for real. "
-    "publish_post runs the full chain itself (validate, card, insert, and on a real "
-    "run: commit and push, wait for live, update the RAG corpus) and stops at the "
-    "first failure — read back its result and trace in plain language. The individual "
-    "tools (validate_post, generate_card, insert_card, commit_and_push, wait_for_live, "
-    "update_corpus, list_posts) remain available if the user asks for a single step."
+    "publish_post runs the full chain itself (validate, and on a real run: commit "
+    "and push, wait for live, update the RAG corpus) and stops at the first failure; "
+    "read back its result and trace in plain language. The blog index, RSS feed, and "
+    "OG image are built by GitHub Actions on the push, not by the agent. The "
+    "individual tools (validate_post, commit_and_push, wait_for_live, update_corpus, "
+    "list_posts) remain available if the user asks for a single step."
 )
 
 def to_anthropic(mcp_tools):
