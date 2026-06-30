@@ -76,81 +76,31 @@ def validate_post(slug: str) -> dict:
     }
 
 @mcp.tool()
-def generate_card(slug: str, summary: str = "") -> dict:
-    """Generate the blog-index card HTML for a post by calling generate_card.py.
-    Pass `summary` to override the card teaser line."""
-    cmd = [sys.executable, "scripts/generate_card.py", f"blog/{slug}/index.html"]
-    if summary:
-        cmd += ["--summary", summary]
-    result = subprocess.run(cmd, cwd=BLOG_REPO, capture_output=True, text=True)
-    if result.returncode != 0:
-        return {"slug": slug, "ok": False,
-                "error": result.stderr.strip() or "generate_card.py failed"}
-    return {"slug": slug, "ok": True,
-            "card_html": result.stdout.strip(),
-            "warnings": result.stderr.strip() or None}
-
-@mcp.tool()
-def insert_card(slug: str, card_html: str, dry_run: bool = False) -> dict:
-    """Insert a post card at the top of the blog index (newest-first).
-    Idempotent: does nothing if a card for this slug is already present.
-    dry_run=True reports what would happen without writing."""
-    index_path = BLOG_REPO / "blog" / "index.html"
-    if not index_path.exists():
-        return {"slug": slug, "ok": False, "error": "blog/index.html not found"}
-    html = index_path.read_text(encoding="utf-8")
-
-    if f'/blog/{slug}/"' in html:
-        return {"slug": slug, "ok": True, "inserted": False, "reason": "already in index"}
-
-    card = card_html.strip()
-    marker = "<!-- post-cards -->"
-    if marker in html:
-        new_html = html.replace(marker, marker + "\n" + card, 1)
-        anchor = "marker"
-    else:
-        m = re.search(r'<article class="post-card">', html)
-        if not m:
-            return {"slug": slug, "ok": False,
-                    "error": "no insertion point: add a '<!-- post-cards -->' marker or a first card to blog/index.html"}
-        new_html = html[:m.start()] + card + "\n" + html[m.start():]
-        anchor = "before first card"
-
-    if dry_run:
-        return {"slug": slug, "ok": True, "inserted": False, "would_insert": True, "anchor": anchor}
-
-    index_path.write_text(new_html, encoding="utf-8")
-    return {"slug": slug, "ok": True, "inserted": True, "anchor": anchor}
-
-@mcp.tool()
 def commit_and_push(slug: str, message: str = "", dry_run: bool = False) -> dict:
-    """Stage the post and the blog index, commit, and push to the remote.
+    """Stage and commit the post, then push to the remote.
 
-    Stages only blog/<slug>/index.html and blog/index.html — the two files a publish
-    touches — so unrelated working-tree changes are left alone. Idempotent: if those
-    files have no changes, it reports nothing to commit rather than erroring.
-    dry_run=True reports what would be committed without writing or pushing.
-
-    Note: the post's OG share image is NOT committed here. It's rendered and
-    committed by the build-og GitHub Action that fires on this push, so it lands a
-    beat after the page. wait_for_live polls for it and reports if it's missing."""
+    Stages only blog/<slug>/index.html — the one file a publish writes. The blog
+    index and feed are regenerated and committed by the build-feed GitHub Action
+    on this push, and the OG share image by the build-og Action, so none of those
+    are committed here. Idempotent: if the post has no changes, it reports nothing
+    to commit rather than erroring.
+    dry_run=True reports what would be committed without writing or pushing."""
     post = f"blog/{slug}/index.html"
-    index = "blog/index.html"
     msg = message or f"Publish: {slug}"
 
-    status = _git("status", "--porcelain", "--", post, index)
+    status = _git("status", "--porcelain", "--", post)
     if status.returncode != 0:
         return {"slug": slug, "ok": False, "error": status.stderr.strip() or "git status failed"}
     pending = [line[3:] for line in status.stdout.splitlines() if line.strip()]
     if not pending:
         return {"slug": slug, "ok": True, "committed": False,
-                "reason": "nothing to commit (post and index already up to date)"}
+                "reason": "nothing to commit (post already up to date)"}
 
     if dry_run:
         return {"slug": slug, "ok": True, "committed": False,
                 "would_commit": pending, "message": msg}
 
-    add = _git("add", "--", post, index)
+    add = _git("add", "--", post)
     if add.returncode != 0:
         return {"slug": slug, "ok": False, "error": add.stderr.strip() or "git add failed"}
     commit = _git("commit", "-m", msg)
@@ -300,16 +250,17 @@ def update_corpus(slug: str, dry_run: bool = False) -> dict:
 
 @mcp.tool()
 def publish_post(slug: str, for_real: bool = False) -> dict:
-    """Run the entire publish chain for a post in one deterministic sequence and
-    stop at the first failure, returning the full trace.
+    """Run the publish chain for a post in one deterministic sequence and stop at
+    the first failure, returning the full trace.
 
-    Order: validate_post -> generate_card -> insert_card -> (if for_real)
-    commit_and_push -> wait_for_live -> update_corpus.
+    Order: validate_post -> (if for_real) commit_and_push -> wait_for_live ->
+    update_corpus. The blog index, the RSS feed, and the OG image are built and
+    committed by GitHub Actions on the push, so they are not steps here.
 
-    for_real=False (the default) is a dry run: it validates, builds the card, and
-    previews the index insert without writing, then stops — nothing is pushed.
-    for_real=True runs the whole thing for keeps. This is the one call the agent
-    should use to publish; the individual tools remain for single-step work.
+    for_real=False (the default) is a dry run: it validates the post and stops,
+    confirming it clears the bar before anything is pushed. for_real=True runs the
+    whole chain for keeps. This is the one call the agent should use to publish;
+    the individual tools remain for single-step work.
 
     A live-but-imageless share card is a warning, not a failure: the post still
     publishes and the corpus still ingests, but `warnings` carries the og:image
@@ -327,17 +278,9 @@ def publish_post(slug: str, for_real: bool = False) -> dict:
     if not v.get("ok"):
         return {"slug": slug, "ok": False, "stopped_at": "validate_post", "trace": trace}
 
-    c = step("generate_card", generate_card(slug))
-    if not c.get("ok"):
-        return {"slug": slug, "ok": False, "stopped_at": "generate_card", "trace": trace}
-
-    ins = step("insert_card", insert_card(slug, c.get("card_html", ""), dry_run=not for_real))
-    if not ins.get("ok"):
-        return {"slug": slug, "ok": False, "stopped_at": "insert_card", "trace": trace}
-
     if not for_real:
         return {"slug": slug, "ok": True, "dry_run": True,
-                "note": "dry run — nothing written or pushed; the steps above would run for real on publish",
+                "note": "dry run — validated only; nothing written or pushed. The index, feed, and image build in CI on a real publish.",
                 "trace": trace}
 
     cp = step("commit_and_push", commit_and_push(slug))
