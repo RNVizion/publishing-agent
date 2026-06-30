@@ -1,6 +1,6 @@
 # rnv-publishing (MCP)
 
-A publishing agent for [rnvizion.dev](https://rnvizion.dev). One instruction ships a blog post end to end: it validates the post, generates the index card, commits and pushes, waits for the page to go live, then refreshes the retrieval assistant that answers questions about the site. The post's social share image is rendered separately by CI, so the agent stays light.
+A publishing agent for [rnvizion.dev](https://rnvizion.dev). One instruction ships a blog post end to end: it validates the post, commits and pushes, waits for the page to go live, then refreshes the retrieval assistant that answers questions about the site. The post's index card, RSS feed, and social share image are all rendered separately by CI, so the agent stays light.
 
 A language model decides *whether* to publish. Deterministic tools do the work, in a fixed order, and refuse to ship anything broken.
 
@@ -15,22 +15,20 @@ The hard part of an agent isn't getting a model to call tools; it's keeping the 
 - **Reasoning is the model's job.** It makes a single judgment from a plain-language request: publish this post, or don't; for real, or as a dry run.
 - **Execution is the tools' job.** Every step that touches the filesystem, git, or the network is an ordinary Python function with one responsibility and a typed result. No step improvises.
 
-The orchestration itself is code, not a prompt. `publish_post` runs the chain in sequence and stops at the first step that returns `ok: false`. That's deliberate: an earlier version let the model orchestrate the steps freely, and it occasionally skipped one, publishing a post with no index card. Moving the sequence into a tool removed that whole class of error. The model's only decision is the one a model is actually good at.
+The orchestration itself is code, not a prompt. `publish_post` runs the chain in sequence and stops at the first step that returns `ok: false`. That's deliberate: an earlier version let the model orchestrate the steps freely, and it occasionally skipped one. Moving the sequence into a tool removed that whole class of error. The model's only decision is the one a model is actually good at.
 
 ## The chain
 
 `publish_post(slug, for_real)` runs, in order:
 
 1. `validate_post` — checks the post carries everything the feed needs; **stops the publish if a required field is missing**
-2. `generate_card` — builds the blog-index card from the post's own metadata
-3. `insert_card` — inserts it at the top of the index (idempotent; a re-run is a no-op)
-4. `commit_and_push` — stages the post and the blog index (the card lives inside the index), commits, and pushes
-5. `wait_for_live` — polls the live URL until it returns 200, so nothing downstream runs against a page that hasn't deployed; then confirms the post's `og:image` is reachable and flags it if not
-6. `update_corpus` — registers the post with the RAG corpus and triggers a rebuild
+2. `commit_and_push` — stages and commits the post, then pushes
+3. `wait_for_live` — polls the live URL until it returns 200, so nothing downstream runs against a page that hasn't deployed; then confirms the post's `og:image` is reachable and flags it if not
+4. `update_corpus` — registers the post with the RAG corpus and triggers a rebuild
 
-A **dry run** (`for_real=false`, the default) runs steps 1–3 in preview and stops, writing and pushing nothing. It's a full rehearsal with no side effects.
+A **dry run** (`for_real=false`, the default) runs step 1 and stops, writing and pushing nothing. It confirms the post clears the required-field bar before any real publish.
 
-The per-post Open Graph share image is **not** the agent's job. A GitHub Action in the site repo (`build-og`) renders it with Pillow when the push from step 4 lands, and commits it back. The agent never imports an image library, fetches a font, or stages a PNG.
+The post's index card, RSS feed, and Open Graph share image are **not** the agent's job. Two GitHub Actions in the site repo handle them on the push from step 2: `build-feed` regenerates the blog index and `feed.xml` from the posts, and `build-og` renders the share image with Pillow and commits it back. The agent never writes the index, builds a feed, imports an image library, or stages a PNG.
 
 ## Refusal as a design value
 
@@ -50,9 +48,7 @@ One check is deliberately softer than the rest. `wait_for_live` also confirms th
 | --- | --- |
 | `list_posts` | Enumerate published posts with slug, title, date |
 | `validate_post` | Gate: required vs. recommended fields |
-| `generate_card` | Build the blog-index card |
-| `insert_card` | Insert the card, newest-first (idempotent) |
-| `commit_and_push` | Stage the post and index, commit, push |
+| `commit_and_push` | Stage and commit the post, push |
 | `wait_for_live` | Poll until the page serves 200, then confirm the `og:image` (warn-only) |
 | `update_corpus` | Register the post and trigger a RAG rebuild |
 | `publish_post` | Run the whole chain, stopping at the first failure |
@@ -62,7 +58,7 @@ One check is deliberately softer than the rest. `wait_for_live` also confirms th
 Run from a Codespace on the site repo, where the agent has native write access:
 
 ```bash
-# rehearse — validates, builds the card, previews the insert, writes nothing
+# rehearse — validates the post and stops, writes nothing
 python agent.py "Publish blog/<slug> as a dry run."
 
 # ship it — runs the full chain
@@ -73,19 +69,19 @@ After a real publish, give the `build-og` Action a minute or two to finish befor
 
 ## How it fits together
 
-The agent edits the **site** repo directly and pushes natively. Two pieces of heavier work run in CI instead, where they belong:
+The agent edits the **site** repo directly and pushes natively. The heavier work runs in CI instead, where it belongs:
 
+- **The index, feed, and share image.** On the push, two Actions in the site repo regenerate the blog index and RSS feed from the posts (`build-feed`) and render the per-post Open Graph image (`build-og`), each committing its output back. Image rendering, font handling, and HTML generation never touch the publishing environment.
 - **The RAG rebuild.** `update_corpus` commits a one-line source change to the corpus repo, and a GitHub Action there re-ingests and pushes the vector store to a Hugging Face Space. The heavy ML dependencies and the Hugging Face token stay in CI, never in the publishing environment.
-- **The share image.** A GitHub Action in the site repo (`build-og`) renders the per-post Open Graph image with Pillow on push and commits it back. Image rendering and font handling never touch the publishing environment either.
 
 ```
-agent.py  ──drives──►  server.py (FastMCP: 8 tools)
+agent.py  ──drives──►  server.py (FastMCP: 6 tools)
                             │
         ┌───────────────────┼────────────────────┐
    site repo            live site (poll)     corpus repo
    (Pages)                                   → Action → HF Space
       │
-      └─ on push → Action (build-og) → renders OG image, commits it back
+      └─ on push → build-feed (index + feed) + build-og (OG image), committed back
 ```
 
 ## Setup
@@ -97,7 +93,7 @@ Environment:
 - `CORPUS_REPO` — path to the corpus checkout (default `/workspaces/ask-the-corpus`)
 - `SITE_URL` — live origin for `wait_for_live` (default `https://rnvizion.dev`)
 
-Dependencies: the Anthropic SDK and the MCP SDK. Install with `pip install -r requirements.txt`. The agent does no image work, so Pillow is not a dependency here — it lives in the site repo's `build-og` workflow.
+Dependencies: the Anthropic SDK and the MCP SDK. Install with `pip install -r requirements.txt`. The agent does no image, feed, or HTML rendering, so Pillow and the like are not dependencies here — that work lives in the site repo's build workflows.
 
 ## What this demonstrates
 
@@ -106,7 +102,7 @@ For anyone reading this as work rather than docs:
 - **Agentic design that's safe by construction.** The model holds one decision; the pipeline is deterministic code. Failures are typed and stop the chain, not silent.
 - **MCP as a tool layer.** A clean FastMCP server with small, single-purpose, idempotent tools that compose.
 - **Integrity gating.** "Refuse to ship broken" is enforced in code, at three points, not left to a prompt.
-- **The right work in the right place.** Rendering and ML rebuilds run in CI; the agent stays a light, legible orchestrator. The division is the design.
+- **The right work in the right place.** Index and feed generation, image rendering, and ML rebuilds all run in CI; the agent stays a light, legible orchestrator. The division is the design.
 - **Real automation on a real system.** It extends an existing static site, feed, and retrieval assistant; it isn't a toy built to demo the pattern.
 
 ---
